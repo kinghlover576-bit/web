@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
 
 from ingestion import page_loader
-from processing.text import html_to_text
+from processing.text import extract_title, html_to_text
 from search.pipeline import Doc as SearchDoc
 from search.pipeline import search_docs
 
@@ -66,7 +66,8 @@ async def ax_search_post(body: SearchRequest) -> dict[str, Any]:
             text = html_to_text(html)
             if not text:
                 continue
-            docs.append(SearchDoc(id=u, title=None, url=u, content=text))
+            title = extract_title(html)
+            docs.append(SearchDoc(id=u, title=title, url=u, content=text))
 
     ranked = search_docs(docs, body.query, top_k=body.top_k) if docs else []
     return {

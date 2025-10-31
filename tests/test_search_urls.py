@@ -35,3 +35,4 @@ def test_post_ax_search_with_urls(monkeypatch):
     ranked = data["ranked"]
     assert len(ranked) == 2
     assert ranked[0]["id"] == "https://x.test/a"
+    assert ranked[0]["title"] == "A"
