@@ -1,6 +1,7 @@
+import asyncio
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 
 app = FastAPI(title="OmniVerse AX API", version="0.1.0")
 
@@ -22,3 +23,13 @@ def ax_search(q: str, preempt: bool = True) -> dict[str, Any]:
         "preempt": ["next-hop: stub"] if preempt else [],
         "ranked": results,
     }
+
+
+@app.websocket("/ws-stream")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    await websocket.accept()
+    # Send a few heartbeat messages then close from server side
+    for i in range(3):
+        await websocket.send_json({"stream": "ax-update", "seq": i})
+        await asyncio.sleep(0.05)
+    await websocket.close()
