@@ -2,6 +2,10 @@ import asyncio
 from typing import Any
 
 from fastapi import FastAPI, WebSocket
+from pydantic import BaseModel
+
+from search.pipeline import Doc as SearchDoc
+from search.pipeline import search_docs
 
 app = FastAPI(title="OmniVerse AX API", version="0.1.0")
 
@@ -22,6 +26,33 @@ def ax_search(q: str, preempt: bool = True) -> dict[str, Any]:
         "debated": "resolved-intent: stub",
         "preempt": ["next-hop: stub"] if preempt else [],
         "ranked": results,
+    }
+
+
+class DocIn(BaseModel):
+    id: str
+    title: str | None = None
+    url: str | None = None
+    content: str
+
+
+class SearchRequest(BaseModel):
+    query: str
+    docs: list[DocIn] | None = None
+    urls: list[str] | None = None
+    top_k: int = 5
+
+
+@app.post("/ax-search")
+def ax_search_post(body: SearchRequest) -> dict[str, Any]:
+    # Prefer provided docs for deterministic, testable behavior; URL fetching not wired yet.
+    docs_in = body.docs or []
+    docs = [SearchDoc(id=d.id, title=d.title, url=d.url, content=d.content) for d in docs_in]
+    ranked = search_docs(docs, body.query, top_k=body.top_k) if docs else []
+    return {
+        "debated": "resolved-intent: tfidf",
+        "preempt": [],
+        "ranked": ranked,
     }
 
 
