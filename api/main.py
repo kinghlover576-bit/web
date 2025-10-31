@@ -4,6 +4,8 @@ from typing import Any
 from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
 
+from ingestion import page_loader
+from processing.text import html_to_text
 from search.pipeline import Doc as SearchDoc
 from search.pipeline import search_docs
 
@@ -44,10 +46,28 @@ class SearchRequest(BaseModel):
 
 
 @app.post("/ax-search")
-def ax_search_post(body: SearchRequest) -> dict[str, Any]:
+async def ax_search_post(body: SearchRequest) -> dict[str, Any]:
     # Prefer provided docs for deterministic, testable behavior; URL fetching not wired yet.
     docs_in = body.docs or []
     docs = [SearchDoc(id=d.id, title=d.title, url=d.url, content=d.content) for d in docs_in]
+
+    # Fetch and extract URLs concurrently (best-effort)
+    urls = body.urls or []
+    if urls:
+        results = await asyncio.gather(
+            *(page_loader.fetch_url(u) for u in urls), return_exceptions=True
+        )
+        for u, res in zip(urls, results, strict=False):
+            if isinstance(res, BaseException):
+                continue
+            status, html, _ctype = res
+            if status != 200 or not html:
+                continue
+            text = html_to_text(html)
+            if not text:
+                continue
+            docs.append(SearchDoc(id=u, title=None, url=u, content=text))
+
     ranked = search_docs(docs, body.query, top_k=body.top_k) if docs else []
     return {
         "debated": "resolved-intent: tfidf",
