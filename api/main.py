@@ -43,6 +43,8 @@ class SearchRequest(BaseModel):
     docs: list[DocIn] | None = None
     urls: list[str] | None = None
     top_k: int = 5
+    strategy: str | None = "tfidf"  # "tfidf" | "hybrid"
+    alpha: float = 0.5
 
 
 @app.post("/ax-search")
@@ -69,7 +71,21 @@ async def ax_search_post(body: SearchRequest) -> dict[str, Any]:
             title = extract_title(html)
             docs.append(SearchDoc(id=u, title=title, url=u, content=text))
 
-    ranked = search_docs(docs, body.query, top_k=body.top_k) if docs else []
+    strategy = (body.strategy or "tfidf").lower()
+    if docs:
+        if strategy == "hybrid":
+            from search.hybrid import HybridConfig, hybrid_search
+
+            ranked = hybrid_search(
+                docs,
+                body.query,
+                top_k=body.top_k,
+                cfg=HybridConfig(alpha=body.alpha),
+            )
+        else:
+            ranked = search_docs(docs, body.query, top_k=body.top_k)
+    else:
+        ranked = []
     return {
         "debated": "resolved-intent: tfidf",
         "preempt": [],
