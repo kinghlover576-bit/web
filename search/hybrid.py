@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from embeddings.cache import embed_with_cache
 from embeddings.hashing import embed_texts
 from index.tfidf import TfidfIndex
 from search.pipeline import Doc
@@ -13,6 +14,9 @@ from vector.store import InMemoryVectorStore
 class HybridConfig:
     dim: int = 256
     alpha: float = 0.5  # weight for embedding score; (1-alpha) for tf-idf
+    provider: str = "hashed"  # "hashed" | "sbert"
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    cache_dir: str | None = None
 
 
 def hybrid_search(
@@ -30,11 +34,38 @@ def hybrid_search(
     tf_scores = dict(tf.search(query, top_k=len(ordered)))
 
     # Build vector store
-    store = InMemoryVectorStore(dim=cfg.dim)
-    vectors = embed_texts([d.content for d in ordered], dim=cfg.dim)
-    store.add([d.id for d in ordered], vectors)
-    q_vec = embed_texts([query], dim=cfg.dim)
+    if cfg.provider == "sbert":
+        try:
+            from embeddings.sbert import embed_texts as sbert_embed
+
+            def compute(batch: list[str]):
+                return sbert_embed(batch, model_name=cfg.model_name)
+
+            cache_ns = f"sbert:{cfg.model_name}"
+            vectors = embed_with_cache(
+                [d.content for d in ordered], cache_ns, compute, cache_dir=cfg.cache_dir
+            )
+            q_vec = embed_with_cache([query], cache_ns, compute, cache_dir=cfg.cache_dir)
+            dim = int(vectors.shape[1]) if vectors.size else 0
+        except Exception:
+            # Fallback to hashed if sbert unavailable
+            vectors = embed_texts([d.content for d in ordered], dim=cfg.dim)
+            q_vec = embed_texts([query], dim=cfg.dim)
+            dim = cfg.dim
+    else:
+        vectors = embed_texts([d.content for d in ordered], dim=cfg.dim)
+        q_vec = embed_texts([query], dim=cfg.dim)
+        dim = cfg.dim
+
+    store = InMemoryVectorStore(dim=dim if dim else cfg.dim)
     v_scores = dict(store.search(q_vec, top_k=len(ordered)))
+    if store.items == [] and vectors.size:
+        # Add after init if not added yet
+        store.add([d.id for d in ordered], vectors)
+        v_scores = dict(store.search(q_vec, top_k=len(ordered)))
+    else:
+        store.add([d.id for d in ordered], vectors)
+        v_scores = dict(store.search(q_vec, top_k=len(ordered)))
 
     # Combine
     alpha = float(cfg.alpha)

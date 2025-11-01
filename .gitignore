@@ -16,3 +16,5 @@ coverage*
 .coverage*
 node_modules/
 *.log
+.omniverse_cache/
+.omniverse_store/
