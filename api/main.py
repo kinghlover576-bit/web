@@ -1,5 +1,6 @@
 import asyncio
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
@@ -7,6 +8,7 @@ from pydantic import BaseModel
 from crawl.crawler import crawl_site
 from index.persistent import get_index
 from ingestion import page_loader
+from ingestion.cache import fetch_url_cached
 from processing.summarize import research_digest, summarize
 from processing.text import extract_title, html_to_text
 from search.pipeline import Doc as SearchDoc
@@ -302,3 +304,162 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.send_json({"stream": "ax-update", "seq": i})
         await asyncio.sleep(0.05)
     await websocket.close()
+
+
+# -------- Websets: declarative, domain-scoped research -------- #
+
+
+def _domain(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _allowed(url: str, include: set[str] | None, exclude: set[str] | None) -> bool:
+    d = _domain(url)
+    if exclude and any(d == ex or d.endswith("." + ex) for ex in exclude):
+        return False
+    if include:
+        return any(d == inc or d.endswith("." + inc) for inc in include)
+    return True
+
+
+class WebsetsRequest(BaseModel):
+    objective: str | None = None
+    objectives: list[str] | None = None
+    urls: list[str] | None = None
+    start_urls: list[str] | None = None
+    include_domains: list[str] | None = None
+    exclude_domains: list[str] | None = None
+    live_fetch: bool = False
+    max_age_hours: int = 24
+    fetch_timeout: float = 10.0
+    max_pages_per_start: int = 50
+    max_depth: int = 2
+    concurrency: int = 8
+    llm_mode: str = "dense"  # "dense" | "full"
+    snippet_len: int = 240
+    docs: list[DocIn] | None = None
+    test_pages: dict[str, str] | None = None  # url->html for CI
+
+
+@app.post("/websets")
+async def websets(body: WebsetsRequest) -> dict[str, Any]:
+    include = set(body.include_domains or []) or None
+    exclude = set(body.exclude_domains or []) or None
+    objective = body.objective or "; ".join(body.objectives or [])
+
+    collected: dict[str, tuple[str | None, str]] = {}
+
+    # Provided docs
+    for d in body.docs or []:
+        if _allowed(d.url or d.id, include, exclude):
+            collected[d.url or d.id] = (d.title, d.content)
+
+    # Fetch URLs (with cache)
+    urls = body.urls or []
+    if urls:
+        fetcher_url: Callable[[str], Awaitable[tuple[int, str, str | None]]] | None = None
+        if body.test_pages is not None:
+            pages_map: dict[str, str] = body.test_pages or {}
+
+            async def _fake(
+                u: str, _pages: dict[str, str] = pages_map
+            ) -> tuple[int, str, str | None]:
+                html = _pages.get(u)
+                if html is None:
+                    return 404, "", "text/html"
+                return 200, html, "text/html; charset=utf-8"
+
+            fetcher_url = _fake
+
+        results = await asyncio.gather(
+            *(
+                fetch_url_cached(
+                    u,
+                    max_age_hours=body.max_age_hours,
+                    live_fetch=body.live_fetch,
+                    timeout=body.fetch_timeout,
+                    fetch=fetcher_url,
+                )
+                for u in urls
+            ),
+            return_exceptions=True,
+        )
+        for u, res in zip(urls, results, strict=False):
+            if isinstance(res, BaseException):
+                continue
+            status, html, _ctype = res
+            if status != 200 or not html:
+                continue
+            if not _allowed(u, include, exclude):
+                continue
+            text = html_to_text(html)
+            title = extract_title(html)
+            if text:
+                collected[u] = (title, text)
+
+    # Crawl per start URL
+    for su in body.start_urls or []:
+        fetcher: Callable[[str], Awaitable[tuple[int, str, str | None]]] | None = None
+        if body.test_pages is not None:
+            pages_map2: dict[str, str] = body.test_pages or {}
+
+            async def _fake(
+                u: str, _pages: dict[str, str] = pages_map2
+            ) -> tuple[int, str, str | None]:
+                html = _pages.get(u)
+                if html is None:
+                    return 404, "", "text/html"
+                return 200, html, "text/html; charset=utf-8"
+
+            fetcher = _fake
+
+        pages = await crawl_site(
+            su,
+            max_pages=body.max_pages_per_start,
+            max_depth=body.max_depth,
+            concurrency=body.concurrency,
+            timeout=body.fetch_timeout,
+            fetch=fetcher,
+        )
+        for p in pages:
+            if p.content and _allowed(p.url, include, exclude):
+                collected[p.url] = (p.title, p.content)
+
+    items = [
+        {
+            "url": u,
+            "title": t[0],
+            **(
+                {"content": t[1]}
+                if body.llm_mode == "full"
+                else {"snippet": t[1][: body.snippet_len]}
+            ),
+        }
+        for u, t in collected.items()
+    ]
+
+    digest = research_digest(
+        objective or "",
+        [
+            (
+                cast(str, it["url"]),
+                str(it.get("title") or ""),
+                str(it.get("content") or it.get("snippet") or ""),
+            )
+            for it in items
+        ],
+        max_highlights=7,
+    )
+
+    return {
+        "objective": objective,
+        "count": len(items),
+        "filters": {"include": list(include or []), "exclude": list(exclude or [])},
+        "results": items,
+        **digest,
+    }
